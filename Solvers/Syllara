@@ -1,0 +1,561 @@
+package main
+
+import (
+	varstorage "Addons/VarStorage"
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+var (
+	FuncaptchaKeys    = varstorage.DefaultKeys
+	FuncaptchaPresets = varstorage.DefaultPresets
+	Verbose           = false
+
+	// ANSI Color codes
+	ColorReset  = "\033[0m"
+	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorBlue   = "\033[34m"
+
+	// Colored loggers
+	infoLogger  = log.New(os.Stdout, ColorGreen+"[INFO] "+ColorReset, log.LstdFlags)
+	errorLogger = log.New(os.Stderr, ColorRed+"[ERROR] "+ColorReset, log.LstdFlags)
+	debugLogger = log.New(os.Stdout, ColorYellow+"[DEBUG] "+ColorReset, log.LstdFlags)
+)
+
+type CaptchaRequest struct {
+	PublicKey        string            `json:"publicKey"`
+	Site             string            `json:"site"`
+	Surl             string            `json:"surl"`
+	CapiMode         string            `json:"capiMode"`
+	StyleTheme       string            `json:"styleTheme"`
+	LanguageEnabled  bool              `json:"languageEnabled"`
+	JsfEnabled       bool              `json:"jsfEnabled"`
+	ExtraData        map[string]string `json:"extraData"`
+	AncestorOrigins  []string          `json:"ancestorOrigins"`
+	TreeIndex        []int             `json:"treeIndex"`
+	TreeStructure    string            `json:"treeStructure"`
+	LocationHref     string            `json:"locationHref"`
+	DocumentReferrer string            `json:"documentReferrer,omitempty"`
+}
+
+type BrowserInfo struct {
+	Cookie    string `json:"Cookie"`
+	SecChUa   string `json:"Sec-Ch-Ua"`
+	UserAgent string `json:"User-Agent"`
+	Mobile    bool   `json:"Mobile"`
+}
+
+type SolverPayload struct {
+	Key           string         `json:"key"`
+	ChallengeInfo CaptchaRequest `json:"challengeInfo"`
+	BrowserInfo   BrowserInfo    `json:"browserInfo"`
+	Proxy         string         `json:"proxy"`
+	CookieStr     string         `json:"cookie_str"`
+	LogData       struct {
+		CaptchaType string `json:"captchaType"`
+		Payload     struct {
+			Preset        string `json:"preset"`
+			ChromeVersion string `json:"chrome_version"`
+			Proxy         string `json:"proxy"`
+			Blob          string `json:"blob"`
+		} `json:"payload"`
+	} `json:"logData"`
+}
+
+type SolutionResponse struct {
+	Status string                 `json:"status"`
+	Result map[string]interface{} `json:"result"`
+	Error  string                 `json:"error,omitempty"`
+}
+
+type TaskData struct {
+	Token     string
+	Variant   string
+	Waves     int
+	CreatedAt time.Time
+}
+
+func main() {
+	link := flag.String("l", "https://syllara.com", "The API endpoint URL for the captcha solver")
+	port := flag.String("p", "8080", "The port to run the server on")
+	apiKey := flag.String("k", "", "The API key for the captcha solver")
+	Verbose = *flag.Bool("v", false, "Enable Verbose logging for debugging")
+	flag.Parse()
+
+	// Validate inputs
+	if *apiKey == "" {
+		errorLogger.Fatal("API key is required")
+	}
+	if *port == "" {
+		errorLogger.Fatal("Port is required")
+	}
+
+	infoLogger.Printf("Starting server on port %s with API endpoint: %s", *port, *link)
+	if Verbose {
+		debugLogger.Println("Verbose mode enabled")
+	}
+
+	apiUrl := *link
+	srv := &http.Server{Addr: ":" + *port}
+	tasks := make(map[string]TaskData)
+
+	// Background task cleanup
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			for taskID, task := range tasks {
+				if time.Since(task.CreatedAt) > 30*time.Minute {
+					delete(tasks, taskID)
+					debugLogger.Printf("Cleaned up old task: %s", taskID)
+				}
+			}
+		}
+	}()
+
+	http.HandleFunc("/createTask", func(w http.ResponseWriter, r *http.Request) {
+		infoLogger.Println("Received createTask request")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload SolverPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			errorLogger.Printf("Decoding payload: %v", err)
+			http.Error(w, fmt.Sprintf("Invalid request payload: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		payload.Key = *apiKey
+
+		if Verbose {
+			payloadBytes, _ := json.MarshalIndent(payload, "", "  ")
+			debugLogger.Printf("Full payload:\n%s", string(payloadBytes))
+			debugLogger.Printf("Headers: %v", r.Header)
+		}
+
+		// Set defaults
+		if payload.LogData.CaptchaType == "" {
+			payload.LogData.CaptchaType = "funcaptcha"
+		}
+		if payload.LogData.Payload.Preset == "" {
+			for name, key := range FuncaptchaKeys {
+				if key == payload.ChallengeInfo.PublicKey {
+					payload.LogData.Payload.Preset = FuncaptchaPresets[name]
+					break
+				}
+			}
+			if payload.LogData.Payload.Preset == "" {
+				payload.LogData.Payload.Preset = "roblox_generic"
+			}
+		}
+		if payload.LogData.Payload.ChromeVersion == "" {
+			payload.LogData.Payload.ChromeVersion = os.Getenv("CHROME_VERSION") // Configurable via env
+			if payload.LogData.Payload.ChromeVersion == "" {
+				payload.LogData.Payload.ChromeVersion = "137" // Default
+			}
+		}
+		if payload.LogData.Payload.Blob == "" {
+			if payload.ChallengeInfo.ExtraData != nil {
+				if blob, ok := payload.ChallengeInfo.ExtraData["blob"]; ok {
+					payload.LogData.Payload.Blob = blob
+				} else {
+					payload.LogData.Payload.Blob = "undefined"
+				}
+			} else {
+				payload.LogData.Payload.Blob = "undefined"
+			}
+		}
+		if payload.LogData.Payload.Proxy == "" {
+			payload.LogData.Payload.Proxy = payload.Proxy
+			if payload.LogData.Payload.Proxy == "" {
+				payload.LogData.Payload.Proxy = "undefined"
+			}
+		}
+
+		taskID, err := solveCaptcha(payload, apiUrl)
+		if err != nil {
+			errorLogger.Printf("Solving captcha: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to solve captcha: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if Verbose {
+			infoLogger.Printf("Task created with ID: %s", taskID)
+		}
+
+		token, variant, waves, err := getTaskResult(taskID, apiUrl)
+		if err != nil {
+			errorLogger.Printf("Retrieving task result: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to retrieve task result: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if Verbose {
+			infoLogger.Printf("Retrieved token: %s, variant: %s, waves: %d", token, variant, waves)
+		}
+
+		// Generate UUID for task ID
+		taskID = uuid.New().String()
+		tasks[taskID] = TaskData{
+			Token:     token,
+			Variant:   variant,
+			Waves:     waves,
+			CreatedAt: time.Now(),
+		}
+
+		response := struct {
+			TaskID  string `json:"taskId"`
+			Token   string `json:"token"`
+			Variant string `json:"variant"`
+			Waves   int    `json:"waves"`
+		}{
+			TaskID:  taskID,
+			Token:   token,
+			Variant: variant,
+			Waves:   waves,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			errorLogger.Printf("Encoding response: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if Verbose {
+			responseBytes, _ := json.MarshalIndent(response, "", "  ")
+			debugLogger.Printf("Response body for task creation:\n%s", string(responseBytes))
+		}
+	})
+
+	http.HandleFunc("/taskResult/", func(w http.ResponseWriter, r *http.Request) {
+		infoLogger.Println("Received taskResult request")
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		taskID := r.URL.Path[len("/taskResult/"):]
+		taskData, exists := tasks[taskID]
+		if !exists {
+			errorLogger.Printf("Task not found: %s", taskID)
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return
+		}
+
+		gameInfo := map[string]interface{}{
+			"variant": taskData.Variant,
+			"waves":   taskData.Waves,
+		}
+
+		response := SolutionResponse{
+			Status: "completed",
+			Result: map[string]interface{}{
+				"solution": taskData.Token,
+				"gameInfo": gameInfo,
+				"success":  true,
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			errorLogger.Printf("Encoding response: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if Verbose {
+			responseBytes, _ := json.MarshalIndent(response, "", "  ")
+			debugLogger.Printf("Response body for task result:\n%s", string(responseBytes))
+		}
+	})
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errorLogger.Printf("Failed to start server: %v", err)
+		}
+	}()
+
+	infoLogger.Printf("Server started on port %s", *port)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		errorLogger.Printf("Server shutdown error: %v", err)
+	}
+	infoLogger.Println("Server stopped")
+}
+
+func solveCaptcha(payload SolverPayload, apiUrl string) (string, error) {
+	requestBody := map[string]interface{}{
+		"preset":    payload.LogData.Payload.Preset,
+		"blob":      payload.LogData.Payload.Blob,
+		"proxy":     payload.LogData.Payload.Proxy,
+		"platform":  "chrome",
+		"hardcoded": false,
+		// "cookie_str": payload.CookieStr,
+		"api_key": payload.Key,
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", apiUrl+"/createTask", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var result struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	if result.TaskID == "" {
+		fmt.Println(string(body))
+		return "", fmt.Errorf("no task ID returned")
+	}
+
+	return result.TaskID, nil
+}
+
+func getTaskResult(taskID, apiUrl string) (string, string, int, error) {
+	client := &http.Client{}
+
+	for {
+		payload := map[string]string{
+			"task_id": taskID,
+		}
+		jsonPayload, err := json.Marshal(payload)
+		if err != nil {
+			return "", "", 0, err
+		}
+
+		req, err := http.NewRequest("POST", apiUrl+"/getTask", bytes.NewBuffer(jsonPayload))
+		if err != nil {
+			return "", "", 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", "", 0, err
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", "", 0, err
+		}
+
+		var result struct {
+			Status   string `json:"status"`
+			Token    string `json:"token"`
+			Success  bool   `json:"success"`
+			Variants string `json:"variants"`
+			Waves    int    `json:"waves"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", "", 0, err
+		}
+
+		if result.Status == "completed" && result.Success && result.Token != "" {
+			return result.Token, result.Variants, result.Waves, nil
+		} else if result.Status == "error" {
+			return "", "", 0, fmt.Errorf("task failed: %s", string(body))
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func StartSolverServer() *http.Server {
+	srv := &http.Server{Addr: ":8080"}
+	tasks := make(map[string]TaskData)
+
+	http.HandleFunc("/createTask", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Received createTask request")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload SolverPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			log.Printf("Error decoding payload: %v", err)
+			http.Error(w, fmt.Sprintf("Invalid request payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		fmt.Println(payload)
+
+		if payload.LogData.CaptchaType == "" {
+			payload.LogData.CaptchaType = "funcaptcha"
+		}
+		if payload.LogData.Payload.Preset == "" {
+
+			for name, key := range FuncaptchaKeys {
+				if key == payload.ChallengeInfo.PublicKey {
+					payload.LogData.Payload.Preset = FuncaptchaPresets[name]
+					break
+				}
+			}
+
+			if payload.LogData.Payload.Preset == "" {
+				payload.LogData.Payload.Preset = "roblox_generic"
+			}
+		}
+		if payload.LogData.Payload.ChromeVersion == "" {
+			payload.LogData.Payload.ChromeVersion = "137"
+		}
+		if payload.LogData.Payload.Blob == "" {
+			if payload.ChallengeInfo.ExtraData != nil {
+				if blob, ok := payload.ChallengeInfo.ExtraData["blob"]; ok {
+					payload.LogData.Payload.Blob = blob
+				} else {
+					payload.LogData.Payload.Blob = "undefined"
+				}
+			} else {
+				payload.LogData.Payload.Blob = "undefined"
+			}
+		}
+		if payload.LogData.Payload.Proxy == "" {
+			payload.LogData.Payload.Proxy = payload.Proxy
+			if payload.LogData.Payload.Proxy == "" {
+				payload.LogData.Payload.Proxy = "undefined"
+			}
+		}
+
+		taskID, err := solveCaptcha(payload, "https://enterprises-about-belts-grades.trycloudflare.com")
+		if err != nil {
+			log.Printf("Error solving captcha: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to solve captcha: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		token, variant, waves, err := getTaskResult(taskID, "https://enterprises-about-belts-grades.trycloudflare.com")
+		if err != nil {
+			log.Printf("Error retrieving task result: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to retrieve task result: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Retrieved token: %s, variant: %s, waves: %d", token, variant, waves)
+
+		taskID = fmt.Sprintf("%d", time.Now().UnixNano())
+		tasks[taskID] = TaskData{
+			Token:   token,
+			Variant: variant,
+			Waves:   waves,
+		}
+		response := struct {
+			TaskID  string `json:"taskId"`
+			Token   string `json:"token"`
+			Variant string `json:"variant"`
+			Waves   int    `json:"waves"`
+		}{
+			TaskID:  taskID,
+			Token:   token,
+			Variant: variant,
+			Waves:   waves,
+		}
+		log.Printf("Created task: %s", taskID)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("Error encoding response: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+		}
+
+		if Verbose {
+			responseBytes, _ := json.MarshalIndent(response, "", "  ")
+			debugLogger.Printf("Response body for task creation:\n%s", string(responseBytes))
+		}
+	})
+
+	http.HandleFunc("/taskResult/", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Received taskResult request")
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		taskID := r.URL.Path[len("/taskResult/"):]
+		taskData, exists := tasks[taskID]
+		if !exists {
+			log.Printf("Task not found: %s", taskID)
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return
+		}
+
+		gameInfo := map[string]interface{}{
+			"variant": taskData.Variant,
+			"waves":   taskData.Waves,
+		}
+
+		response := SolutionResponse{
+			Status: "completed",
+			Result: map[string]interface{}{
+				"solution": taskData.Token,
+				"gameInfo": gameInfo,
+				"success":  true,
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			errorLogger.Printf("Encoding response: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if Verbose {
+			responseBytes, _ := json.MarshalIndent(response, "", "  ")
+			debugLogger.Printf("Response body for task result:\n%s", string(responseBytes))
+		}
+	})
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Failed to start solver server: %v\n", err)
+		}
+	}()
+
+	return srv
+}
